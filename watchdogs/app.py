@@ -23,7 +23,7 @@ import pyxel
 
 from .serial_manager import SerialManager, detect_esp32_port
 from .gps_manager import GpsManager
-from .loot_manager import LootManager
+from .loot_manager import LootManager, is_portal_form_line
 from .app_state import AppState, Network
 from .network_manager import NetworkManager
 from .coastline import COASTLINES
@@ -3455,14 +3455,18 @@ class WatchDogsGame:
 
         # --- Portal / Evil Twin capture parsing ---
         if self.state.portal_running or self.state.evil_twin_running:
-            is_form = ("received post" in sl or "form submission" in sl)
+            is_form = is_portal_form_line(s)
             is_client = ("client connected" in sl or "client count" in sl)
             if is_form or is_client:
                 tag = "EP" if self.state.portal_running else "ET"
                 if self.state.portal_running and self.loot:
-                    self.loot.save_portal_event(s)
+                    self.loot.save_portal_activity(s)
+                    if is_form:
+                        self.loot.save_portal_event(s)
                 if self.state.evil_twin_running and self.loot:
-                    self.loot.save_evil_twin_event(s)
+                    self.loot.save_evil_twin_activity(s)
+                    if is_form:
+                        self.loot.save_evil_twin_event(s)
                 if is_form:
                     # URL-decode captured data for display
                     try:
@@ -7442,6 +7446,8 @@ class WatchDogsGame:
                             encoding="utf-8", errors="replace").splitlines():
                         raw_line = raw_line.strip()
                         if not raw_line:
+                            continue
+                        if not is_portal_form_line(raw_line):
                             continue
                         decoded = unquote_plus(raw_line)
                         fields = self._parse_post_fields(decoded)

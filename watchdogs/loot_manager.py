@@ -11,7 +11,9 @@ Session directory layout:
             <ssid>_<bssid>.pcap  – real pcap (from start_handshake_serial)
             <ssid>_<bssid>.hccapx – hashcat format (from start_handshake_serial)
             <ssid>_<bssid>.22000 – hc22000 hash (auto-generated from complete hccapx)
+        portal_events.log        – portal client/form activity
         portal_passwords.log     – portal form submissions
+        evil_twin_events.log     – evil twin client/form activity
         evil_twin_capture.log    – evil twin captured data
         attacks.log              – attack start/stop events
 """
@@ -31,6 +33,21 @@ from typing import List, Optional
 from .app_state import AppState, Network, SnifferAP, ProbeEntry
 
 log = logging.getLogger(__name__)
+
+
+LOOT_DB_VERSION = 2
+
+_PORTAL_FORM_MARKERS = (
+    "received post",
+    "form submission",
+    "received form data",
+)
+
+
+def is_portal_form_line(line: str) -> bool:
+    """Return True when an ESP32 portal/twin log line contains form data."""
+    sl = line.lower()
+    return any(marker in sl for marker in _PORTAL_FORM_MARKERS)
 
 
 def _fsync_file(fh) -> None:
@@ -204,9 +221,12 @@ class LootManager:
             try:
                 with open(self._db_path, "r", encoding="utf-8") as fh:
                     data = json.load(fh)
-                if isinstance(data, dict) and "version" in data and "sessions" in data:
+                if (isinstance(data, dict)
+                        and data.get("version") == LOOT_DB_VERSION
+                        and "sessions" in data):
                     log.info("Loot DB loaded: %d sessions", len(data.get("sessions", {})))
                     return data
+                log.info("Loot DB version changed, rebuilding")
             except (json.JSONDecodeError, OSError) as exc:
                 log.warning("Loot DB corrupted (%s), rebuilding", exc)
         return self._rebuild_db()
@@ -217,7 +237,7 @@ class LootManager:
         Also generates .22000 files retroactively for any .hccapx that
         doesn't already have a corresponding .22000 file.
         """
-        db: dict = {"version": 1, "sessions": {}, "totals": {}}
+        db: dict = {"version": LOOT_DB_VERSION, "sessions": {}, "totals": {}}
         if not self._base.is_dir():
             return db
         for entry in sorted(self._base.iterdir()):
@@ -265,13 +285,19 @@ class LootManager:
         pw_file = session_path / "portal_passwords.log"
         if pw_file.is_file():
             try:
-                counts["passwords"] = sum(1 for _ in open(pw_file, encoding="utf-8"))
+                counts["passwords"] = sum(
+                    1 for line in open(pw_file, encoding="utf-8")
+                    if is_portal_form_line(line)
+                )
             except OSError:
                 pass
         et_file = session_path / "evil_twin_capture.log"
         if et_file.is_file():
             try:
-                counts["et_captures"] = sum(1 for _ in open(et_file, encoding="utf-8"))
+                counts["et_captures"] = sum(
+                    1 for line in open(et_file, encoding="utf-8")
+                    if is_portal_form_line(line)
+                )
             except OSError:
                 pass
         mc_nodes_file = session_path / "meshcore_nodes.csv"
@@ -1083,10 +1109,20 @@ class LootManager:
     # Portal
     # ------------------------------------------------------------------
 
+    def save_portal_activity(self, line: str) -> None:
+        """Append a portal activity line without affecting credential counts."""
+        if not self._session_active:
+            return
+        filepath = self._session / "portal_events.log"
+        ts = datetime.now().strftime("%H:%M:%S")
+        _sync_append(filepath, f"[{ts}] {line}\n")
+
     def save_portal_event(self, line: str) -> None:
         """Append a portal password/form submission line. fsync'd — this is
         captured-credential data we can't afford to lose on power failure."""
         if not self._session_active:
+            return
+        if not is_portal_form_line(line):
             return
         filepath = self._session / "portal_passwords.log"
         ts = datetime.now().strftime("%H:%M:%S")
@@ -1097,9 +1133,19 @@ class LootManager:
     # Evil Twin
     # ------------------------------------------------------------------
 
+    def save_evil_twin_activity(self, line: str) -> None:
+        """Append an evil twin activity line without affecting capture counts."""
+        if not self._session_active:
+            return
+        filepath = self._session / "evil_twin_events.log"
+        ts = datetime.now().strftime("%H:%M:%S")
+        _sync_append(filepath, f"[{ts}] {line}\n")
+
     def save_evil_twin_event(self, line: str) -> None:
         """Append an evil twin capture line. fsync'd — captured credentials."""
         if not self._session_active:
+            return
+        if not is_portal_form_line(line):
             return
         filepath = self._session / "evil_twin_capture.log"
         ts = datetime.now().strftime("%H:%M:%S")
