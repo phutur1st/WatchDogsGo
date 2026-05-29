@@ -1398,6 +1398,12 @@ class WatchDogsGame:
             if not self.loot_screen:
                 self._loot_pwd_screen = False
 
+        # Background plugin tick — runs every frame regardless of overlay state
+        # so plugins with background workers (e.g. Discord remote) keep running.
+        for p in self._plugins:
+            if not getattr(p, 'overlay_active', False):
+                p.on_update()
+
         # Overlay screens — block normal input
         if self._et_net_screen or self._portal_select_screen:
             self._update_picker_overlay()
