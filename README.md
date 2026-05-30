@@ -1,5 +1,7 @@
 # Watch Dogs Go
 
+> **Work in progress:** The Discord Remote plugin (`plugins/discord_remote.py`) is under active development — features and commands may change.
+
 Open-world hacking RPG with real cybersecurity tooling. A pyxel game frontend for the ESP32-C5 security device, inspired by Watch Dogs aesthetics.
 
 ![Watch Dogs Go — main screen](docs/screenshots/01_main_screen.png)
