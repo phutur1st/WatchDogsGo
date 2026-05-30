@@ -3518,6 +3518,7 @@ class WatchDogsGame:
                     self._attack_step = ""
             elif self._wifi_scan_only:
                 self._wifi_scan_only = False
+                self._wifi_scan_done_time = time.time()
                 self.msg("[WiFi] Scan complete", C_SUCCESS)
             elif self.wifi_scanning:
                 # Wardriving auto-repeat
@@ -3526,6 +3527,7 @@ class WatchDogsGame:
                 or "ble scan done" in sl or "bt scan done" in sl):
             if self._ble_scan_only:
                 self._ble_scan_only = False
+                self._bt_scan_done_time = time.time()
                 self.msg("[BLE] Scan complete", C_SUCCESS)
             elif self.ble_scanning:
                 # Wardriving auto-repeat

