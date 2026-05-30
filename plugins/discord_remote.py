@@ -113,7 +113,7 @@ class _RemoteRequest:
 class DiscordRemote(PluginBase):
     NAME = "Discord Remote"
     VERSION = "0.1"
-    AUTHOR = "phutur1st"
+    AUTHOR = "locosp"
 
     def __init__(self):
         super().__init__()
